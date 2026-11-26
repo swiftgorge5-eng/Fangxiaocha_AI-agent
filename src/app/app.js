@@ -1,5 +1,8 @@
 
 'use strict';
+import { runSampleRoom } from './sample-room.ts';
+import { REPORT_RULES } from '../core/report-rules.ts';
+import { toSafeError } from '../core/errors.ts';
 // Replace this adapter with the team's photo service. Inputs remain local until run() is called.
 // Contract: run({photos:[{id,mimeType,dataUrl}], signal}) returns a structured photo report.
 window.HomeSafePhotoService = window.HomeSafePhotoService || null;
@@ -13,6 +16,7 @@ const formatTime=value=>new Date(value).toLocaleString('zh-CN',{year:'numeric',m
 const uid=()=>globalThis.crypto?.randomUUID?.()||Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
 const state={tab:'photo',page:'photo',confirmingPhotos:false,photos:[],uploadInitialized:false,uploadRoom:'',photoCommunity:'',photoPlace:null,photoError:'',reading:false,job:null,photoReport:null,city:'上海',query:'',searchDistrict:'',districtExpanded:false,searched:false,results:[],searchSession:uid(),searchReports:new Map(),records:[],recordsLoading:true,recordError:'',filter:'all',report:null,origin:null,scroll:{photo:0,search:0,records:0},saveStates:new Map()};
 let dbPromise,toastTimer,toastCallback,zoom=1,searchSequence=0;
+const sampleRoom={controller:null,result:null,message:''};
 function db(){if(!dbPromise)dbPromise=new Promise((resolve,reject)=>{if(!window.indexedDB){reject(new Error('当前浏览器不支持本机记录'));return;}const request=indexedDB.open('homesafe-mobile-v1',1);request.onupgradeneeded=()=>request.result.createObjectStore('reports',{keyPath:'id'});request.onsuccess=()=>{const result=request.result;result.onversionchange=()=>{result.close();dbPromise=null;};resolve(result);};request.onerror=()=>{dbPromise=null;reject(request.error);};request.onblocked=()=>{dbPromise=null;reject(new Error('请关闭其他打开的本页面后重试'));};});return dbPromise;}
 async function storage(mode,operation){const database=await db();return new Promise((resolve,reject)=>{const tx=database.transaction('reports',mode);let result;const request=operation(tx.objectStore('reports'));request.onsuccess=()=>{result=request.result;};tx.oncomplete=()=>resolve(result);tx.onabort=()=>reject(tx.error||new Error('存储操作未完成'));tx.onerror=()=>reject(tx.error||new Error('存储失败'));});}
 async function loadRecords(){state.recordsLoading=true;state.recordError='';if(state.page==='records')render();try{state.records=await storage('readonly',store=>store.getAll());}catch(error){state.recordError='本机记录读取失败，请确认浏览器允许保存站点数据后重试。';}finally{state.recordsLoading=false;if(state.page==='records'||state.page==='photo')render();}}
@@ -29,6 +33,7 @@ function openReport(report,shouldSave=true){dismissNotice();state.origin={page:s
 function back(){dismissNotice();const origin=state.origin||{page:state.tab,tab:state.tab,scroll:0};state.page=origin.page;state.tab=origin.tab;state.report=null;state.origin=null;render();window.scrollTo(0,origin.scroll);focusPage();}
 function render(){
  const isReport=state.page==='report';
+ const isSample=state.page==='sample-room';
  $('app').classList.toggle('report-view',isReport);
  const isCommunity=isReport&&state.report.type==='community';
  $('app').classList.toggle('community-redesign',isCommunity);
@@ -46,7 +51,8 @@ function render(){
  $('app').classList.toggle('search-view',isSearch);
  $('header').classList.toggle('location-header',isSearch);
  $('header').innerHTML=header(isReport?(state.report.type==='photo'?'照片分析报告':'小区历史问题'):'');
- $('header').classList.toggle('sub',isReport);
+ $('header').classList.toggle('sub',isReport||isSample);
+ if(isSample)$('header').innerHTML=`<button type="button" class="icon-button page-back" data-action="close-sample-room" aria-label="返回首页">${icon('back')}</button><span class="top-title">样板间</span><span></span>`;
  if(isPhotoAnalysis)$('header').innerHTML=paHeader(state.report);
  if(isHome){$('header').innerHTML='<div class="brand"><span class="brand-logo">'+icon('house')+'</span><span class="home-name">房小查</span><span class="brand-subtitle">租房看房助手</span></div><button type="button" class="icon-button home-bell" data-action="home-notices" aria-label="消息通知">'+icon('home-bell')+'</button>';}
  if(isConfirm){
@@ -56,9 +62,9 @@ function render(){
  if(isSearch){
   $('header').innerHTML=`<button class="icon-button page-back" data-tab="photo" aria-label="返回首页">${icon('back')}</button><h1>小区查询</h1><span></span>`;
  }
- $('nav').hidden=isReport||isConfirm;
+ $('nav').hidden=isReport||isConfirm||isSample;
  $('nav').innerHTML=[['photo',isHome?'home-nav-camera':'camera','照片分析'],['search','search','小区查询'],['records','record','看过的房']].map(([key,i,label])=>`<button type="button" data-tab="${key}" ${state.tab===key?'aria-current="page"':''}><span class="nav-icon">${icon(i)}</span>${label}</button>`).join('');
- $('main').innerHTML=isReport?reportPage(state.report):state.page==='search'?searchPage():state.page==='records'?recordsPage():photoPage();
+ $('main').innerHTML=isSample?sampleRoomPage():isReport?reportPage(state.report):state.page==='search'?searchPage():state.page==='records'?recordsPage():photoPage();
  paRestoreGallery();
 }
 function openMapPicker(){
@@ -123,12 +129,78 @@ function homePage(){
  return `<section class="home-hero"><span class="home-hero-art" aria-hidden="true"></span><h1>租房之前，<br>先查一查</h1><p>看照片 · 查小区 · 识风险</p></section>
  <div class="home-features">${features}</div>
  <button class="home-primary" type="button" data-action="open-photo-confirm">${icon('home-camera')}<span><strong>上传房源照片分析${icon('home-forward')}</strong><small>支持多空间 · AI 评估房屋风险与品质</small></span></button>
+ <button class="btn secondary sample-room-entry" type="button" data-action="open-sample-room">打开双图样板间 · 免 API Key</button>
  <div class="home-shortcuts">
   <button class="home-shortcut home-secondary" type="button" data-tab="search">${icon('house')}<span><strong>查询小区</strong><small>查看历史问题与配套</small></span>${icon('arrow')}</button>
   <button class="home-shortcut" type="button" data-tab="records">${icon('home-doc')}<span><strong>历史报告</strong><small>查看过往分析结果</small></span>${icon('arrow')}</button>
  </div>
  <div class="home-section-title"><h2>最近分析的房源</h2>${examples?'<small class="home-example-label">示例</small>':''}<button class="home-all" type="button" data-tab="records">查看全部${icon('arrow')}</button></div>
  ${recentContent}`;
+}
+
+function sampleRoomPage(){
+ const {controller,result,message}=sampleRoom;
+ const report=result?.report;
+ const statusLabels={present:'可见',absent:'未见',unknown:'无法判断'};
+ return `<section class="intro">
+  <h1>双图样板间</h1>
+  <p>演示数据 · 免 API Key。使用客厅和厨房样图，照片观察与小区证据均由本地模拟生成，不代表真实房源。</p>
+ </section>
+ ${controller?`<div class="progress"><p id="sample-room-progress" role="status">正在加载并处理样图…</p><button type="button" class="btn text" data-action="cancel-sample-room">取消演示</button></div>`:''}
+ ${message?`<p class="${message==='已取消演示。'?'progress':'error'}" role="${message==='已取消演示。'?'status':'alert'}">${escapeHtml(message)}</p>`:''}
+ ${result?.issues.length?`<div class="error" role="alert"><strong>${report?'已使用剩余样图生成演示报告。':'没有可分析的样图。'}</strong><ul>${result.issues.map(issue=>`<li>${escapeHtml(issue)}</li>`).join('')}</ul></div>`:''}
+ ${report?`<section class="sample-room-section">
+  <h2>照片观察 · 演示</h2>
+  <p>已分析 ${result.photos.length} / 2 张样图</p>
+  <div class="sample-room-photos">${result.photos.map(photo=>`<article class="sample-room-card">
+   <img src="${escapeHtml(photo.dataUrl)}" alt="${escapeHtml(photo.name)}样图">
+   <h3>${escapeHtml(photo.name)}</h3>
+   <ul>${photo.observations.map(row=>`<li><strong>${REPORT_RULES.labels[row.category]} · ${statusLabels[row.state]}</strong><p>${escapeHtml(row.evidence.join('；'))}</p></li>`).join('')}</ul>
+  </article>`).join('')}</div>
+ </section>
+ <section class="sample-room-section"><h2>示例小区证据</h2>
+  ${report.evidence.items.map(item=>`<article class="sample-room-card"><h3>${escapeHtml(item.communityName)} · ${escapeHtml(item.title)}</h3><p>合成演示数据 · ${escapeHtml(item.publisher)}</p><p>${escapeHtml(item.summary)}</p></article>`).join('')}
+ </section>
+ <section class="sample-room-section"><h2>局限说明</h2>
+  <p>${escapeHtml(report.risk.explanation)}</p>
+  <ul>${report.limitations.map(item=>`<li>${escapeHtml(item)}</li>`).join('')}</ul>
+ </section>`:''}
+ ${controller?'':`<button type="button" class="btn secondary" data-action="retry-sample-room">${report&&!result.issues.length?'重新运行演示':'重试演示'}</button>`}`;
+}
+
+async function startSampleRoom(){
+ if(sampleRoom.controller)return;
+ if(state.page==='photo'){
+  state.scroll.photo=window.scrollY;
+  state.page='sample-room';
+  window.scrollTo(0,0);
+ }
+ const controller=new AbortController();
+ Object.assign(sampleRoom,{controller,result:null,message:''});
+ render();
+ focusPage();
+ try{
+  const stages={observing:'正在生成演示照片观察…',retrieving:'正在读取示例小区证据…',composing:'正在整理演示报告…'};
+  const result=await runSampleRoom(stage=>{
+   const progress=$('sample-room-progress');
+   if(sampleRoom.controller===controller&&progress&&stages[stage])progress.textContent=stages[stage];
+  },controller.signal);
+  if(sampleRoom.controller===controller)sampleRoom.result=result;
+ }catch(error){
+  if(sampleRoom.controller===controller)sampleRoom.message='演示未完成：'+toSafeError(error).message+'。请重试。';
+ }finally{
+  if(sampleRoom.controller===controller){
+   sampleRoom.controller=null;
+   render();
+   focusPage();
+  }
+ }
+}
+
+function cancelSampleRoom(){
+ const controller=sampleRoom.controller;
+ sampleRoom.controller=null;
+ controller?.abort();
 }
 
 function openHomeExample(id){
@@ -888,6 +960,14 @@ document.addEventListener('click',async event=>{const target=event.target.closes
  return;
 }if(target.dataset.candidate!==undefined){chooseCandidate(Number(target.dataset.candidate));return;}if(target.dataset.homeExample){openHomeExample(target.dataset.homeExample);return;}if(target.dataset.openRecord){const report=state.records.find(r=>r.id===target.dataset.openRecord);if(report){state.saveStates.set(report.id,'saved');openReport(report);}return;}if(target.dataset.delete){await deleteRecord(target.dataset.delete);return;}if(target.dataset.filter){state.filter=target.dataset.filter;render();return;}switch(target.dataset.action){
 case 'home-notices':$('home-notices').showModal();break;
+case 'open-sample-room':
+case 'retry-sample-room':
+ await startSampleRoom();break;
+case 'cancel-sample-room':
+ cancelSampleRoom();sampleRoom.message='已取消演示。';render();focusPage();break;
+case 'close-sample-room':
+ cancelSampleRoom();sampleRoom.result=null;navigate('photo');
+ document.querySelector('.sample-room-entry')?.focus({preventScroll:true});break;
  case 'show-location':{
   const report=state.report;
   const location=report&&report.location;
@@ -951,7 +1031,7 @@ for(const id of ['album','camera']){
   addPhotos(files,room);
  });
 }
-window.addEventListener('beforeunload',event=>{if(state.job||state.reading){event.preventDefault();event.returnValue='';}});
+window.addEventListener('beforeunload',event=>{if(state.job||state.reading||sampleRoom.controller){event.preventDefault();event.returnValue='';}});
 let printDetails=[];
 window.addEventListener('beforeprint',()=>{printDetails=[...document.querySelectorAll('.cr-card details,.pr-detail,.pr-other')].filter(d=>!d.open);printDetails.forEach(d=>d.open=true);});
 window.addEventListener('afterprint',()=>{printDetails.forEach(d=>d.open=false);printDetails=[];});
